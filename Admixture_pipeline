@@ -1,0 +1,117 @@
+#!/bin/bash
+#SBATCH --time=10:00
+#SBATCH --account=def-sgravel
+#SBATCH --cpus-per-task=1
+##SBATCH --mem-per-cpu=200MB
+#SBATCH --job-name=Admixture_pipeline
+#SBATCH -o Admixture_pipeline_%A.out
+
+###### Load modules ######
+module load StdEnv/2020
+module load plink/1.9b_6.21-x86_64
+
+if [ -n "$SLURM_JOB_ID" ];  then
+    echo "THIS IS A JOB"
+    # check the original location through scontrol and $SLURM_JOB_ID
+    pipeline_path=$(scontrol show job $SLURM_JOBID | awk -F= '/Command=/{print $2}' | cut -f1 -d" ")
+    echo -e "command run in: $pipeline_path"
+    bin=$(dirname "${pipeline_path}")/bin
+else
+    # otherwise: started with bash. Get the real location.
+    #bin=$(dirname ${BASH_SOURCE[0]})/bin
+    bin=$(dirname $0)/bin
+fi
+
+
+echo -e "Running scripts in directory $bin"
+
+###### Functions ######
+function usage()
+{
+   # Display Help
+   echo
+   echo "Syntax: sbatch $(basename $0) [-a] -p [path to plink base] -K [list or range] -r [int]"
+   echo
+   echo "Options:"
+   echo "-h     Print usage."
+   echo "-p     path to plink files (basename)."
+   echo "-K     Int, List or range of Ks to test."
+   echo "           -K 2,5,7 will test Ks 2,5,7"
+   echo "           -K 2-4 will test Ks 2,3,4"
+   echo "           -K 1-7:2 will test Ks 1,3,5,7"
+   echo "-r     Number of independent runs per K."
+   echo "-l     Tune the ld pruning option in plink. Default = 0.5"
+   echo "-a     Optional. Plot with clumpp and distruct."
+   echo
+   exit 0;
+}
+
+visualize=0 # default set it to 0 unless specified 
+ldprune=0.5 # default set to 0.5 unless specified
+
+###### Parsing arguments ######
+[ $# -eq 0 ] && usage
+while getopts ':hal:p:K:r:' opt; 
+do
+  case "$opt" in
+    p)
+      plinkf="${OPTARG}";;
+    K)
+      array="${OPTARG}";;
+    r)
+      runs="${OPTARG}";;
+    a)
+      visualize=1;;
+    l)
+      ldprune="${OPTARG}";;
+    h | *)
+      usage
+      exit 0;;
+  esac
+done
+
+if [[ -z $plinkf ]] || [[ -z $array ]] || [[ -z $runs ]]
+then
+     echo -e "Arguments missing.\n"
+     usage
+     exit 1
+fi
+
+echo -e "Arguments provided:\n Plink path: $plinkf \n Ks: $array \n Independent runs: $runs \n"
+
+###### Main ######
+plink=$(basename $plinkf) # basename of plinkf
+
+# 1. Prune data by LD using plink
+echo "Prunning data by LD with plink"
+plink --bfile $plinkf --indep-pairwise 50 10 $ldprune --out ${plink}
+plink --bfile $plinkf --extract ${plink}.prune.in --make-bed --out ${plink}.pruned
+
+# (optional) 1.1 Convert binary files to be able to compute bootstrap 
+# plink --bfile ${plink}.pruned --recode --tab --out ${plink}.pruned
+
+fam=${plink}.pruned.fam
+c=$(cut -f1 -d" " $fam | sort -u | wc -l) # Number of populations
+paste <(seq 1 $c) <(cut -f1 -d" " $fam | uniq) > ${plink}.names # Labels for plot
+inds=$(cat $fam | wc -l) # Number of individuals
+
+# # # 2. Run Admixture #jid1
+echo "Running Admixture for Ks: $array"
+jid1=$(sbatch --parsable --array=${array} ${bin}/Submit_K_admixture.sh ${plink}.pruned.bed $runs $bin)
+
+if [ $visualize == 1 ]
+then
+  # 3. Average Runs with CLUMPP 
+  echo "Averaging runs with CLUMPP"
+  # 3.1 format Q files as indfile and popfile #jid2
+  jid2=$(sbatch --parsable --dependency=afterok:$jid1 --array=${array} ${bin}/Format_runs.sh $plink $fam $bin)
+
+  # 3.2 Run CLUMPP #jid3
+  jid3=$(sbatch --parsable --dependency=afterok:$jid2 --array=${array} ${bin}/Run_clumpp.sh $plink $c $inds $runs)
+
+  # 4. Plot Admixture with distruct #jid4
+  echo "Ploting results with distruct"
+  jid4=$(sbatch --parsable --dependency=afterok:$jid3 --array=${array} ${bin}/Run_distruct.sh $plink $c $inds)
+fi
+
+## Written by: Georgette Femerling, maria.femerlingromero@mail.mcgill.ca
